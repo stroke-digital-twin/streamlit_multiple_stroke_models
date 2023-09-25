@@ -35,7 +35,7 @@ def main():
 
     # Title:
     st.markdown('# Multiple models')
-    st.markdown(':warning: This data is rubbish')
+    st.warning(':warning: This data is rubbish')
 
     # ----- Select region -----
     # Choose the region to be plotted.
@@ -71,11 +71,21 @@ def main():
         )
     with open(geojson_file) as f:
         stroke_team_geojson = json.load(f)
-    
+
     # Sort out any problem polygons with coordinates in wrong order:
     from geojson_rewind import rewind
     stroke_team_geojson = rewind(stroke_team_geojson, rfc7946=False)
     # Everything in the MT catchment area:
+
+    # Find extent of this geojson data.
+    import geojson
+    coords = np.array(list(geojson.utils.coords(stroke_team_geojson)))
+    extent = [
+        coords[:,0].min(),
+        coords[:,0].max(),
+        coords[:,1].min(),
+        coords[:,1].max()
+    ]
 
     # Import data for regions in the catchment areas.
     # + Population
@@ -98,7 +108,19 @@ def main():
         './data_msm/admissions_2017-2019.csv',
         # index_col='area'
         )
-
+    # Pick out only the ones we want to show here:
+    df_lsoas_and_nearest_hospitals = pd.merge(
+        df_lsoas_and_nearest_hospitals,
+        df_admissions,
+        left_on='LSOA',
+        right_on='area'
+    )
+    # Convert number of admissions to (admissions here) / (admissions in
+    # all LSOAs being shown here):
+    df_lsoas_and_nearest_hospitals['admissions_chance'] = (
+        df_lsoas_and_nearest_hospitals['Admissions'] /
+        df_lsoas_and_nearest_hospitals['Admissions'].sum()
+    )
 
     # ----- Pathway model -----
     # Import hospital performance statistics.
@@ -126,7 +148,7 @@ def main():
         'Number of trials',
         min_value=0,
         max_value=200,
-        value=100,
+        value=10,
         step=10
         )
     if n_trials == 0:
@@ -136,7 +158,17 @@ def main():
     results_df, outcome_results_columns, trial_columns = stroke_utilities.scenario.set_up_results_dataframe()
 
 
-    scenario_list = sorted(list(set(df_performance_scenarios['scenario'])))
+    # scenario_list = sorted(list(set(df_performance_scenarios['scenario'])))
+    scenario_list = [
+        'onset + benchmark',
+        'onset',
+        'speed + onset',
+        'benchmark',
+        'speed + onset + benchmark',
+        'speed',
+        'speed + benchmark',
+        'base'
+    ]
     df_scenario_outcomes_by_lsoa = pd.DataFrame()
     df_scenario_outcomes_by_lsoa['LSOA'] = df_lsoas_and_nearest_hospitals['LSOA']
     df_scenario_outcomes_by_lsoa.set_index('LSOA', inplace=True)
@@ -184,12 +216,50 @@ def main():
             # Patients' mRS in this trial...
             mrs_post_stroke = patient_array_outcomes['each_patient_mrs_post_stroke']
 
-            # Randomly (for now) assign patients to LSOAs:
-            # np.random.seed(42)
-            patient_array_lsoas = np.random.choice(
+            # Assign patients to LSOAs.
+            # Random choice weighted by number of admissions.
+            initial_choice_lsoas = np.random.choice(
                 df_lsoas_and_nearest_hospitals['LSOA'],
-                size=number_of_patients
+                size=number_of_patients,
+                p=df_lsoas_and_nearest_hospitals['admissions_chance']
             )
+            # For patients with longest travel times, prioritise the
+            # onset-to-arrival times that are longer than the travel
+            # time.
+            # Sort LSOAs by travel time:
+            df_lsoas_and_nearest_hospitals.sort_values('Time (mins) to nearest hospital', inplace=True)
+            # st.write(combo_trial_dict.keys())
+            # st.write(combo_trial_dict['onset_to_arrival_mins'])
+            # st.stop()
+            # Not all patients have an onset to arrival time.
+            # Sometimes the onset is unknown.
+            # So include unknown onset in the pool of things to select from?
+            times_onset_to_arrival = combo_trial_dict['onset_to_arrival_mins']
+            time_chosen_bool = np.full(times_onset_to_arrival.shape, False)
+            patient_array_lsoas = np.full(initial_choice_lsoas.shape, '', dtype=object)
+            for r in range(len(df_lsoas_and_nearest_hospitals)):
+                row = df_lsoas_and_nearest_hospitals.loc[r]
+                # st.write(row)
+                if row['LSOA'] in initial_choice_lsoas:
+                    time_here = row['Time (mins) to nearest hospital']
+                    # Indices of patients meeting time criteria:
+                    inds_times_subset = np.where(
+                        (time_chosen_bool == False) &
+                        ((times_onset_to_arrival >= time_here) |
+                        (np.isnan(times_onset_to_arrival)))
+                    )[0]
+                    # st.write(row)
+                    # st.write(time_here)
+                    # st.write(inds_times_subset)
+                    # Randomly pick some indices from this subset:
+                    n_inds_to_update = len(np.where(initial_choice_lsoas == row['LSOA'])[0])
+                    inds_chosen = np.random.choice(
+                        inds_times_subset,
+                        size=n_inds_to_update
+                    )
+                    patient_array_lsoas[inds_chosen] = row['LSOA']
+                    time_chosen_bool[inds_chosen] = False
+            # st.write(patient_array_lsoas)
 
             # Calculate mean change in outcome by LSOA:
             outcomes_by_lsoa = []
@@ -213,13 +283,19 @@ def main():
     # fig = go.Figure()
     # df_scenario_outcomes_by_lsoa.set_index('LSOA', inplace=True)
 
-    outcome_vmin = df_scenario_outcomes_by_lsoa.min().min()
-    outcome_vmax = df_scenario_outcomes_by_lsoa.max().max()
+    outcome_lim = np.max(np.abs([
+        df_scenario_outcomes_by_lsoa.min().min(),
+        df_scenario_outcomes_by_lsoa.max().max()
+    ]))
+    outcome_vmin = -outcome_lim
+    outcome_vmax = outcome_lim
 
     from plotly.subplots import make_subplots
     fig = make_subplots(
         rows=3, cols=3, subplot_titles=scenario_list,
-        specs=[[{"type": "choropleth"}]*3]*3
+        specs=[[{"type": "choropleth"}]*3]*3,
+        horizontal_spacing=0.0,
+        vertical_spacing=0.0
     )
 
     fig.update_layout(
@@ -256,7 +332,7 @@ def main():
         # fig.update_traces(marker_line_width=0, selector=dict(type='choropleth'))
 
         fig.update_layout(
-            coloraxis_colorscale='Electric',
+            coloraxis_colorscale='Picnic',#'Electric',
             coloraxis_colorbar_title_text='mRS shift',
             coloraxis_cmin=outcome_vmin,
             coloraxis_cmax=outcome_vmax,
@@ -268,26 +344,72 @@ def main():
             col = 1
             row += 1
     geo_dict = dict(
-            scope='world',
-            projection=go.layout.geo.Projection(type = 'airy'),
-            fitbounds='locations',
-            visible=False)#, domain_row=row, domain_column=col)
-    
-    fig.update_layout(
-        geo1 = geo_dict,
-        geo2 = geo_dict,
-        geo3 = geo_dict,
-        geo4 = geo_dict,
-        geo5 = geo_dict,
-        geo6 = geo_dict,
-        geo7 = geo_dict,
-        geo8 = geo_dict,
-        # geo9 = geo_dict,
-    ) 
-    st.plotly_chart(fig)
+        scope='world',
+        projection=go.layout.geo.Projection(type = 'airy'),
+        # fitbounds='geojson',
+        lonaxis_range=[extent[0], extent[1]],
+        lataxis_range=[extent[2], extent[3]],
+        projection_scale=1,
+        visible=False
+        )#, domain_row=row, domain_column=col)
+
+    # fig.update_layout(
+    #     geo1 = geo_dict,
+    #     geo2 = geo_dict,
+    #     geo3 = geo_dict,
+    #     geo4 = geo_dict,
+    #     geo5 = geo_dict,
+    #     geo6 = geo_dict,
+    #     geo7 = geo_dict,
+    #     geo8 = geo_dict
+    # )
+    fig.update_geos(geo_dict)
 
 
-        
+
+    # fig['layout']['geo1']['projection']['scale'] = 3
+    # fig['layout']['geo2']['projection']['scale'] = 5
+
+    # Disable zoom and pan using mouse:
+    fig.update_layout(dragmode=False)
+
+    # fig.update_layout(config={'modeBarButtonsToRemove':['zoomInGeo']})
+
+    button1= dict(method = "relayout",
+                args = [{"geo1.projection.scale": 5,
+                        "geo2.projection.scale": 5}], 
+                label = "zoom1=5.9<br>zoom2=5.3"
+            )
+    button2= dict(method = "relayout",
+                args=[{"geo1.projection.scale": 4,
+                        "geo2.projection.scale": 6}], 
+                label="zoom1=4.75<br>zoom2=6.2"
+                )
+
+    button3= dict(method = "relayout",
+                args=[{"geo1.projection.scale": 4,
+                        "geo2.projection.scale": 6}], 
+                label="zoom1=4<br>zoom2=6.35"
+                )
+
+    fig.update_layout(updatemenus=[dict(active=0,
+                                        buttons=[button1, button2, button3],
+                                    x=0.99, y=0.99, xanchor='right', yanchor='top')
+                                ])
+
+    # st.write(fig.layout)
+    plotly_config={}
+    #     'modeBarButtonsToRemove': ['zoom', 'pan']
+    # }
+
+    # st.plotly_chart(fig)
+    st.plotly_chart(
+        fig,
+        # use_container_width=True,
+        config=plotly_config
+        )
+
+
     #     for trial in range(n_trials):
     #         # ... run the pathways...
     #         combo_trial_dict = stroke_utilities.scenario.run_trial_of_pathways(pathway_object_dict)
